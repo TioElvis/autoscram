@@ -15,14 +15,41 @@ WIN_KEYWORDS = ("win", "flag", "shell", "backdoor", "secret", "giveshell",
                 "give_shell", "get_shell", "getshell", "print_flag", "get_flag",
                 "cat_flag", "readflag", "admin", "magic", "success", "pwn")
 
-UNBOUNDED_READS = ("gets", "__isoc23_scanf", "scanf")
+# Caller-saved (volatile) registers in the System V AMD64 ABI. Their contents
+# are undefined after a `call`, so any address we tracked in them is stale and
+# must be dropped, or a later strcmp/read arg can be misread from a value that
+# actually belonged to an earlier, unrelated call.
+CALLER_SAVED = ("rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11")
+
+# Map every 8/16/32-bit sub-register to its 64-bit parent, so that an argument
+# set as `mov edx, 0x100` is seen when we later read `rdx`. Without this the
+# read() length (loaded into edx) and many buffer moves are missed.
+_CANON = {}
+for _q, _d, _w, _b in [
+    ("rax", "eax", "ax", "al"), ("rbx", "ebx", "bx", "bl"),
+    ("rcx", "ecx", "cx", "cl"), ("rdx", "edx", "dx", "dl"),
+    ("rsi", "esi", "si", "sil"), ("rdi", "edi", "di", "dil"),
+    ("rbp", "ebp", "bp", "bpl"), ("rsp", "esp", "sp", "spl"),
+]:
+    for _r in (_q, _d, _w, _b):
+        _CANON[_r] = _q
+for _n in range(8, 16):
+    _q = f"r{_n}"
+    for _suf in ("", "d", "w", "b"):
+        _CANON[f"{_q}{_suf}"] = _q
+
+
+def _canon(reg):
+    """Return the 64-bit parent of a register name (identity if unknown)."""
+    return _CANON.get(reg, reg)
 
 
 @dataclass
 class InputSite:
-    func: str            # scanf / gets
+    func: str            # scanf / gets / read / fgets
     off: int             # rbp-relative offset where input lands
-    unbounded: bool
+    unbounded: bool      # True = can overflow its buffer (overflow primitive)
+    nbytes: int = None   # declared read length, when known (read/fgets)
 
 
 @dataclass
@@ -97,6 +124,15 @@ def analyze(binary):
     elf = binary.elf
     res = Analysis()
 
+    # The instruction tracking below is x86-64 specific (rbp frames, SysV ABI
+    # arg registers, 64-bit gadgets). Bail cleanly on anything else instead of
+    # disassembling it as amd64 and reporting nonsense.
+    if binary.arch != "amd64":
+        res.notes.append(
+            f"architecture is {binary.arch}, not amd64: AUTOSCRAM's analyzer "
+            "and strategies are x86-64 only, so nothing was analyzed")
+        return res
+
     # win functions from symbols
     for name, addr in binary.functions():
         low = name.lower()
@@ -139,9 +175,9 @@ def analyze(binary):
         # ---- track address computations ----
         if mn == "lea" and len(ops) == 2 and ops[0].type == X86_OP_REG \
                 and ops[1].type == X86_OP_MEM:
-            dst = insn.reg_name(ops[0].reg)
+            dst = _canon(insn.reg_name(ops[0].reg))
             mem = ops[1].mem
-            base = insn.reg_name(mem.base) if mem.base else None
+            base = _canon(insn.reg_name(mem.base)) if mem.base else None
             disp = mem.disp
             if base == "rbp":
                 regs[dst] = ("rbp", disp)
@@ -154,9 +190,9 @@ def analyze(binary):
                 regs[dst] = None
 
         elif mn == "mov" and len(ops) == 2 and ops[0].type == X86_OP_REG:
-            dst = insn.reg_name(ops[0].reg)
+            dst = _canon(insn.reg_name(ops[0].reg))
             if ops[1].type == X86_OP_REG:
-                regs[dst] = val_of(insn.reg_name(ops[1].reg))
+                regs[dst] = val_of(_canon(insn.reg_name(ops[1].reg)))
             elif ops[1].type == X86_OP_IMM:
                 regs[dst] = ("imm", ops[1].imm)
             else:
@@ -164,7 +200,7 @@ def analyze(binary):
 
         elif mn == "add" and len(ops) == 2 and ops[0].type == X86_OP_REG \
                 and ops[1].type == X86_OP_IMM:
-            dst = insn.reg_name(ops[0].reg)
+            dst = _canon(insn.reg_name(ops[0].reg))
             cur = val_of(dst)
             if cur and cur[0] == "rbp":
                 regs[dst] = ("rbp", cur[1] + ops[1].imm)
@@ -174,10 +210,10 @@ def analyze(binary):
             pending_block = True
 
         # ---- calls ----
-        if mn == "call" and ops and ops[0].type == X86_OP_IMM:
-            target = ops[0].imm
-            fname = _norm(names.get(target, ""))
-            rdi, rsi = val_of("rdi"), val_of("rsi")
+        if mn == "call":
+            target = ops[0].imm if (ops and ops[0].type == X86_OP_IMM) else None
+            fname = _norm(names.get(target, "")) if target is not None else ""
+            rdi, rsi, rdx = val_of("rdi"), val_of("rsi"), val_of("rdx")
 
             if fname == "scanf":
                 fmt = rdi if (rdi and rdi[0] == "str") else None
@@ -188,14 +224,29 @@ def analyze(binary):
                         # unbounded only if %s with no width
                         unb = b"%s" in fmt[2]
                     res.inputs.append(InputSite("scanf", buf[1], unb))
-            elif fname in ("gets",):
+            elif fname == "gets":
                 buf = rdi if (rdi and rdi[0] == "rbp") else None
                 if buf is not None:
                     res.inputs.append(InputSite("gets", buf[1], True))
+            elif fname == "read":
+                # read(fd, buf, count): buf in rsi, count in rdx. A read into a
+                # stack buffer is an overflow primitive whenever the count is
+                # large or not statically known (the usual CTF shape).
+                buf = rsi if (rsi and rsi[0] == "rbp") else None
+                if buf is not None:
+                    n = rdx[1] if (rdx and rdx[0] == "imm") else None
+                    res.inputs.append(InputSite("read", buf[1], True, n))
+            elif fname == "fgets":
+                # fgets(buf, size, stream): bounded by size, but still overflows
+                # when size exceeds the buffer. Flag it; leave unbounded False
+                # unless size is unknown so data-overflow stays conservative.
+                buf = rdi if (rdi and rdi[0] == "rbp") else None
+                if buf is not None:
+                    n = rsi[1] if (rsi and rsi[0] == "imm") else None
+                    res.inputs.append(InputSite("fgets", buf[1], n is None, n))
             elif fname == "strcmp":
-                a, b = rdi, rsi
                 buf = const = None
-                for v in (a, b):
+                for v in (rdi, rsi):
                     if v and v[0] == "rbp":
                         buf = v
                     elif v and v[0] == "str":
@@ -207,6 +258,10 @@ def analyze(binary):
                     res.getenv_flag = True
                     res.flag_block = block_start
 
+            # whatever the callee was, its return clobbers the volatile regs
+            for r in CALLER_SAVED:
+                regs.pop(r, None)
+
         if mn == "ret":
             break
 
@@ -217,8 +272,9 @@ def describe(res):
     report.step("Static analysis of main():")
     if res.primary_input:
         i = res.primary_input
+        size = f", n={hex(i.nbytes)}" if i.nbytes is not None else ""
         report.info(f"  input: {i.func}  -> buffer at rbp{i.off:+#x}"
-                    f"  ({'unbounded' if i.unbounded else 'bounded'})")
+                    f"  ({'unbounded' if i.unbounded else 'bounded'}{size})")
     else:
         report.info("  input: none detected")
     for c in res.checks:
