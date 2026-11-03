@@ -46,8 +46,6 @@ class DataOverflow(Strategy):
             return 15, (f"{len(unreachable)} check(s) are BEHIND the input "
                         "buffer (not reachable by a forward overflow)")
         # all gating checks reachable -> very likely the intended bug
-        if any(b"/" in c or len(c) == 0 for _, c in reachable):
-            pass
         return 90, f"{len(reachable)} strcmp check(s) all reachable by overflow"
 
     def build(self, ctx):
@@ -55,10 +53,12 @@ class DataOverflow(Strategy):
         if not reachable:
             return None, False, "nothing to place"
         pairs = sorted(reachable)
-        # whitespace in a value would truncate scanf("%s")
-        for _, v in pairs:
-            if any(w in v for w in (b" ", b"\t", b"\n", b"\x0b", b"\x0c", b"\r")):
-                return None, False, f"value {v!r} contains whitespace"
+        # scanf("%s") stops at whitespace, so a constant containing it can't be
+        # placed; gets/read take raw bytes, so only guard the scanf case.
+        if ctx.analysis.primary_input.func == "scanf":
+            for _, v in pairs:
+                if any(w in v for w in (b" ", b"\t", b"\n", b"\x0b", b"\x0c", b"\r")):
+                    return None, False, f"value {v!r} contains whitespace"
         payload = build_placement(pairs)
         note = "place " + ", ".join(f"{hex(o)}={v!r}" for o, v in pairs)
         if unreachable:
