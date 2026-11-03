@@ -17,10 +17,12 @@ python3 autoscram.py ./challenge --remote host:1337
 
 ## What it does automatically
 
-1. **Triage** — PIE / NX / canary / RELRO, imported functions, `/bin/sh`.
-2. **Static analysis of `main`** (capstone) — tracks `rbp`-relative addresses to
-   find:
-   - the vulnerable input (`scanf("%s")`, `gets`) and **where it writes**,
+1. **Triage** — arch/bits, PIE / NX / canary / RELRO, static vs dynamic, a
+   source-language guess (C / Rust / Go / C++), imported functions, `/bin/sh`.
+2. **Static analysis of `main`** (capstone) — tracks `rbp`-relative addresses
+   (and 8/16/32-bit sub-registers) to find:
+   - the vulnerable input (`read`, `scanf("%s")`, `gets`, `fgets`) and **where
+     it writes**,
    - every `strcmp(buf+off, "constant")` and the offset it guards,
    - the block that prints `getenv("FLAG")` (a ret2win target).
 3. **Strategy ranking** — each strategy scores itself on the analysis; the best
@@ -112,6 +114,12 @@ Subclass `Strategy`, implement `detect(ctx) -> (score, reason)` and
 
 ## Scope / limits
 
+- **x86-64 only.** 32-bit, ARM, MIPS, etc. are detected and refused, not
+  mis-analyzed.
+- **C / libc targets only.** Input and gating are recognized through libc calls
+  (`read`, `scanf`, `gets`, `fgets`, `strcmp`, `system`, `getenv`). **Rust / Go**
+  binaries are memory-safe by default and don't use these; AUTOSCRAM detects the
+  language and says so rather than pretending to analyze them.
 - Handles **non-PIE ret2win / ret2system** and **forward-overflow auth bypass**.
 - **PIE** ret2win/ret2system need a runtime leak — AUTOSCRAM flags this but does
   not yet auto-leak. **Canary** is detected and flagged, not bypassed.
