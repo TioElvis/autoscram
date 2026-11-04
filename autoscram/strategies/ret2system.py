@@ -13,6 +13,7 @@ class Ret2System(Strategy):
     name = "ret2system"
     desc = "ROP system('/bin/sh') for a shell"
     verifiable = False               # spawns a shell; no flag-in-output check
+    interactive = True
 
     def detect(self, ctx):
         b = ctx.binary

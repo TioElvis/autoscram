@@ -1,7 +1,12 @@
-"""Exploit strategies. Each is a Strategy subclass; ALL lists them in priority."""
+"""Exploit strategies. ALL is the registry the orchestrator ranks."""
 from .data_overflow import DataOverflow
 from .ret2win import Ret2Win
 from .ret2system import Ret2System
+from .fmt_leak import FmtLeakRet2Win
+from .flag_checker import FlagChecker
+from .subcipher import SubstitutionCipher
+from .magic_decode import MagicDecode
 
-# Order here is only a tie-break; detect() scores drive the real ranking.
-ALL = [DataOverflow(), Ret2System(), Ret2Win()]
+# Order is only a tie-break; detect() scores drive the real ranking.
+ALL = [FmtLeakRet2Win(), DataOverflow(), Ret2System(), Ret2Win(),
+       FlagChecker(), SubstitutionCipher(), MagicDecode()]

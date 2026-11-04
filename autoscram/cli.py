@@ -8,7 +8,7 @@ from . import report
 from .binary import Binary
 from .analysis import analyze, describe
 from .context import Context
-from .comms import connect, run_payload, self_test, DEFAULT_FLAG_RE
+from .comms import connect, DEFAULT_FLAG_RE
 from . import strategies
 
 
@@ -36,6 +36,8 @@ def _parse_args(argv):
                     help="ret2win: add a `ret` gadget for stack alignment")
     ap.add_argument("--flag-format", default=DEFAULT_FLAG_RE,
                     help="regex used to recognize the flag in output")
+    ap.add_argument("--cipher-input", metavar="TOKENS",
+                    help="subcipher: the challenge ciphertext to decode")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the local self-test before firing")
     ap.add_argument("--yes", action="store_true",
@@ -111,34 +113,51 @@ def main(argv=None):
 
     # --- try strategies in order, verifying locally when possible ---
     for strat in order:
-        payload, interactive, note = strat.build(ctx)
-        if payload is None:
-            report.warn(f"{strat.name}: {note}; skipping.")
-            continue
-        report.ok(f"{strat.name}: {note}")
-
+        # local self-test: run the full strategy against a local copy with a
+        # sentinel FLAG, and check it comes back out.
         if strat.verifiable and not args.no_verify:
             report.step(f"Self-testing {strat.name} on the local binary...")
-            ok = self_test(binary.path, payload, ctx.flag_re,
-                           extra_env={"USER": "ctf", "LOGNAME": "ctf"})
-            if not ok:
-                report.warn(f"{strat.name} did not produce the flag locally; "
+            if not self_test_strategy(strat, ctx, binary.path):
+                report.warn(f"{strat.name} did not yield the flag locally; "
                             "trying the next strategy.")
                 continue
             report.ok(f"{strat.name} verified locally.")
 
-        # fire on the real target
         report.step(f"Firing {strat.name} at "
                     f"{'remote' if remote_target else 'local'} target...")
         io = connect(binary.path, remote_target)
-        flag = run_payload(io, payload, interactive=interactive,
-                           flag_re=ctx.flag_re)
-        if interactive or flag:
+        flag = strat.run(ctx, io)
+        if strat.interactive or flag:
             return 0
         report.warn("No flag captured; trying the next strategy.")
 
     report.err("Exhausted strategies without capturing a flag.")
     return 1
+
+
+def self_test_strategy(strat, ctx, bin_path, sentinel="SCRAMSELFTEST"):
+    """Run the whole strategy against a local process with FLAG=sentinel."""
+    import os
+    from pwn import process
+    env = dict(os.environ)
+    env["FLAG"] = f"FLAG{{{sentinel}}}"
+    env.setdefault("USER", "ctf")
+    env.setdefault("LOGNAME", "ctf")
+    try:
+        io = process(bin_path, env=env)
+    except Exception:
+        return False
+    try:
+        flag = strat.run(ctx, io)
+    except Exception as e:
+        report.warn(f"self-test error: {e}")
+        flag = None
+    finally:
+        try:
+            io.close()
+        except Exception:
+            pass
+    return bool(flag and sentinel in flag)
 
 
 if __name__ == "__main__":
