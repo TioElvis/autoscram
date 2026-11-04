@@ -1,8 +1,10 @@
-"""Static analysis of `main`: find input buffers, strcmp checks, the flag block.
+"""Static analysis of `main`: input sites, strcmp checks, format-string leaks,
+the stack-canary slot, and the flag block.
 
-Uses capstone to walk main linearly and track rbp-relative addresses so it can
-answer: where does the vulnerable read land, which fixed strings are compared
-against which buffer offsets, and where is the block that prints the flag.
+Walks main linearly with capstone, tracking rbp-relative addresses and
+immediate register values, to answer: where does input land and how big is it,
+which fixed strings are compared against which offsets, is a user buffer passed
+to printf as its format (a leak primitive), and where is the canary stored.
 """
 from dataclasses import dataclass, field
 
@@ -13,63 +15,55 @@ from . import report
 
 WIN_KEYWORDS = ("win", "flag", "shell", "backdoor", "secret", "giveshell",
                 "give_shell", "get_shell", "getshell", "print_flag", "get_flag",
-                "cat_flag", "readflag", "admin", "magic", "success", "pwn")
+                "cat_flag", "readflag", "admin", "magic", "success", "pwn",
+                "bypass", "unlock", "immobil", "auth", "decrypt", "reveal",
+                "grant", "override", "engine")
 
-# Caller-saved (volatile) registers in the System V AMD64 ABI. Their contents
-# are undefined after a `call`, so any address we tracked in them is stale and
-# must be dropped, or a later strcmp/read arg can be misread from a value that
-# actually belonged to an earlier, unrelated call.
-CALLER_SAVED = ("rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11")
-
-# Map every 8/16/32-bit sub-register to its 64-bit parent, so that an argument
-# set as `mov edx, 0x100` is seen when we later read `rdx`. Without this the
-# read() length (loaded into edx) and many buffer moves are missed.
-_CANON = {}
-for _q, _d, _w, _b in [
-    ("rax", "eax", "ax", "al"), ("rbx", "ebx", "bx", "bl"),
-    ("rcx", "ecx", "cx", "cl"), ("rdx", "edx", "dx", "dl"),
-    ("rsi", "esi", "si", "sil"), ("rdi", "edi", "di", "dil"),
-    ("rbp", "ebp", "bp", "bpl"), ("rsp", "esp", "sp", "spl"),
-]:
-    for _r in (_q, _d, _w, _b):
-        _CANON[_r] = _q
-for _n in range(8, 16):
-    _q = f"r{_n}"
-    for _suf in ("", "d", "w", "b"):
-        _CANON[f"{_q}{_suf}"] = _q
+# 32-bit -> 64-bit register canonicalization (so `mov edx, N` tracks as rdx)
+_CANON = {"eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
+          "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp"}
 
 
-def _canon(reg):
-    """Return the 64-bit parent of a register name (identity if unknown)."""
-    return _CANON.get(reg, reg)
+def _canon(name):
+    return _CANON.get(name, name)
 
 
 @dataclass
 class InputSite:
-    func: str            # scanf / gets / read / fgets
+    func: str            # scanf / gets / read
     off: int             # rbp-relative offset where input lands
-    unbounded: bool      # True = can overflow its buffer (overflow primitive)
-    nbytes: int = None   # declared read length, when known (read/fgets)
+    unbounded: bool      # True if it can overflow past its buffer
+    size: int = None     # byte count for read()
 
 
 @dataclass
 class Check:
-    off: int             # rbp-relative offset of the compared buffer
-    const: bytes         # the fixed string it's compared against
+    off: int
+    const: bytes
 
 
 @dataclass
 class Analysis:
-    inputs: list = field(default_factory=list)      # list[InputSite]
-    checks: list = field(default_factory=list)      # list[Check]
+    inputs: list = field(default_factory=list)
+    checks: list = field(default_factory=list)
+    fmt_leaks: list = field(default_factory=list)   # rbp offsets used as printf fmt
     getenv_flag: bool = False
-    flag_block: int = None                          # best-effort ret2win target
-    win_funcs: list = field(default_factory=list)   # [(name, addr)]
+    flag_block: int = None
+    win_funcs: list = field(default_factory=list)
+    canary_off: int = None                          # rbp offset of the canary
     notes: list = field(default_factory=list)
 
     @property
     def primary_input(self):
         return self.inputs[0] if self.inputs else None
+
+    def overflow_input(self):
+        """The input most able to smash the return address."""
+        cand = [i for i in self.inputs if i.unbounded]
+        if not cand:
+            return None
+        # biggest reach wins (read size, else assume large for scanf/gets)
+        return max(cand, key=lambda i: i.size or 1 << 20)
 
 
 def _name_map(elf):
@@ -88,10 +82,7 @@ def _norm(name):
 
 
 def find_main(binary):
-    """Return main's address, even on stripped binaries.
-
-    On a stripped ELF there's no 'main' symbol, but _start passes main's
-    address to __libc_start_main in RDI just before the first call."""
+    """Return main's address, even on stripped binaries (via _start's RDI)."""
     elf = binary.elf
     if "main" in elf.symbols:
         return elf.symbols["main"]
@@ -115,135 +106,103 @@ def find_main(binary):
                 and ops[1].type == X86_OP_IMM:
             rdi = ops[1].imm
         elif insn.mnemonic == "call":
-            break               # first call = __libc_start_main
+            break
     return rdi
 
 
-def analyze(binary):
-    """Return an Analysis for the binary's main()."""
-    elf = binary.elf
-    res = Analysis()
-
-    # The instruction tracking below is x86-64 specific (rbp frames, SysV ABI
-    # arg registers, 64-bit gadgets). Bail cleanly on anything else instead of
-    # disassembling it as amd64 and reporting nonsense.
-    if binary.arch != "amd64":
-        res.notes.append(
-            f"architecture is {binary.arch}, not amd64: AUTOSCRAM's analyzer "
-            "and strategies are x86-64 only, so nothing was analyzed")
-        return res
-
-    # win functions from symbols
-    for name, addr in binary.functions():
-        low = name.lower()
-        if any(k in low for k in WIN_KEYWORDS):
-            res.win_funcs.append((name, addr))
-
-    main = find_main(binary)
-    if main is None:
-        res.notes.append("could not locate main (stripped + unusual _start)")
-        return res
-    if "main" not in elf.symbols:
-        res.notes.append(f"stripped: main located via _start @ {hex(main)}")
-
+def _scan(binary, start, md, names):
+    """Linear scan of one function. Returns (partial Analysis, callee addrs)."""
+    part = Analysis()
+    callees = set()
     try:
-        code = elf.read(main, 0x800)
+        code = binary.elf.read(start, 0x900)
     except Exception:
-        res.notes.append("could not read main's bytes")
-        return res
+        return part, callees
 
-    md = Cs(CS_ARCH_X86, CS_MODE_64)
-    md.detail = True
-    names = _name_map(elf)
-
-    # register state: reg -> ('rbp', disp) | ('str', vaddr, text) | None
     regs = {}
-    block_start = main          # start of current basic block
-    pending_block = False       # next insn starts a new block (after a jcc)
+    block_start = start
+    pending_block = False
 
-    def val_of(reg):
-        return regs.get(reg)
+    def V(reg):
+        return regs.get(_canon(reg))
 
-    for insn in md.disasm(code, main):
+    for insn in md.disasm(code, start):
         if pending_block:
             block_start = insn.address
             pending_block = False
-
         mn = insn.mnemonic
         ops = insn.operands
 
-        # ---- track address computations ----
         if mn == "lea" and len(ops) == 2 and ops[0].type == X86_OP_REG \
                 and ops[1].type == X86_OP_MEM:
             dst = _canon(insn.reg_name(ops[0].reg))
             mem = ops[1].mem
-            base = _canon(insn.reg_name(mem.base)) if mem.base else None
+            base = insn.reg_name(mem.base) if mem.base else None
             disp = mem.disp
             if base == "rbp":
                 regs[dst] = ("rbp", disp)
             elif base == "rip":
                 vaddr = insn.address + insn.size + disp
                 regs[dst] = ("str", vaddr, binary.read_cstr(vaddr))
-            elif base and val_of(base) and val_of(base)[0] == "rbp":
-                regs[dst] = ("rbp", val_of(base)[1] + disp)
+            elif base and V(base) and V(base)[0] == "rbp":
+                regs[dst] = ("rbp", V(base)[1] + disp)
             else:
                 regs[dst] = None
 
         elif mn == "mov" and len(ops) == 2 and ops[0].type == X86_OP_REG:
             dst = _canon(insn.reg_name(ops[0].reg))
-            if ops[1].type == X86_OP_REG:
-                regs[dst] = val_of(_canon(insn.reg_name(ops[1].reg)))
-            elif ops[1].type == X86_OP_IMM:
-                regs[dst] = ("imm", ops[1].imm)
+            src = ops[1]
+            if src.type == X86_OP_REG:
+                regs[dst] = V(insn.reg_name(src.reg))
+            elif src.type == X86_OP_IMM:
+                regs[dst] = ("imm", src.imm)
+            elif src.type == X86_OP_MEM and src.mem.segment != 0 \
+                    and src.mem.disp == 0x28:
+                regs[dst] = ("canary",)
             else:
                 regs[dst] = None
+
+        elif mn == "mov" and len(ops) == 2 and ops[0].type == X86_OP_MEM \
+                and ops[1].type == X86_OP_REG:
+            mem = ops[0].mem
+            base = insn.reg_name(mem.base) if mem.base else None
+            if base == "rbp" and V(insn.reg_name(ops[1].reg)) == ("canary",):
+                part.canary_off = mem.disp
 
         elif mn == "add" and len(ops) == 2 and ops[0].type == X86_OP_REG \
                 and ops[1].type == X86_OP_IMM:
             dst = _canon(insn.reg_name(ops[0].reg))
-            cur = val_of(dst)
+            cur = V(dst)
             if cur and cur[0] == "rbp":
                 regs[dst] = ("rbp", cur[1] + ops[1].imm)
 
-        # ---- basic-block tracking ----
         if mn.startswith("j") and mn != "jmp":
             pending_block = True
 
-        # ---- calls ----
-        if mn == "call":
-            target = ops[0].imm if (ops and ops[0].type == X86_OP_IMM) else None
-            fname = _norm(names.get(target, "")) if target is not None else ""
-            rdi, rsi, rdx = val_of("rdi"), val_of("rsi"), val_of("rdx")
+        if mn == "call" and ops and ops[0].type == X86_OP_IMM:
+            target = ops[0].imm
+            fname = _norm(names.get(target, ""))
+            if fname == "" and binary.in_executable(target):
+                callees.add(target)                 # local helper function
+            rdi, rsi, rdx = V("rdi"), V("rsi"), V("rdx")
 
             if fname == "scanf":
-                fmt = rdi if (rdi and rdi[0] == "str") else None
                 buf = rsi if (rsi and rsi[0] == "rbp") else None
-                if buf is not None:
+                if buf:
                     unb = True
-                    if fmt and b"%" in fmt[2]:
-                        # unbounded only if %s with no width
-                        unb = b"%s" in fmt[2]
-                    res.inputs.append(InputSite("scanf", buf[1], unb))
+                    if rdi and rdi[0] == "str" and b"%" in rdi[2]:
+                        unb = b"%s" in rdi[2]
+                    part.inputs.append(InputSite("scanf", buf[1], unb))
             elif fname == "gets":
                 buf = rdi if (rdi and rdi[0] == "rbp") else None
-                if buf is not None:
-                    res.inputs.append(InputSite("gets", buf[1], True))
+                if buf:
+                    part.inputs.append(InputSite("gets", buf[1], True))
             elif fname == "read":
-                # read(fd, buf, count): buf in rsi, count in rdx. A read into a
-                # stack buffer is an overflow primitive whenever the count is
-                # large or not statically known (the usual CTF shape).
                 buf = rsi if (rsi and rsi[0] == "rbp") else None
-                if buf is not None:
-                    n = rdx[1] if (rdx and rdx[0] == "imm") else None
-                    res.inputs.append(InputSite("read", buf[1], True, n))
-            elif fname == "fgets":
-                # fgets(buf, size, stream): bounded by size, but still overflows
-                # when size exceeds the buffer. Flag it; leave unbounded False
-                # unless size is unknown so data-overflow stays conservative.
-                buf = rdi if (rdi and rdi[0] == "rbp") else None
-                if buf is not None:
-                    n = rsi[1] if (rsi and rsi[0] == "imm") else None
-                    res.inputs.append(InputSite("fgets", buf[1], n is None, n))
+                size = rdx[1] if (rdx and rdx[0] == "imm") else None
+                if buf:
+                    reach = size is None or (buf[1] + size) > 8
+                    part.inputs.append(InputSite("read", buf[1], reach, size))
             elif fname == "strcmp":
                 buf = const = None
                 for v in (rdi, rsi):
@@ -251,34 +210,93 @@ def analyze(binary):
                         buf = v
                     elif v and v[0] == "str":
                         const = v
-                if buf is not None and const is not None:
-                    res.checks.append(Check(buf[1], const[2]))
+                if buf and const:
+                    part.checks.append(Check(buf[1], const[2]))
+            elif fname == "printf":
+                if rdi and rdi[0] == "rbp":
+                    part.fmt_leaks.append(rdi[1])
             elif fname == "getenv":
                 if rdi and rdi[0] == "str" and rdi[2] == b"FLAG":
-                    res.getenv_flag = True
-                    res.flag_block = block_start
-
-            # whatever the callee was, its return clobbers the volatile regs
-            for r in CALLER_SAVED:
-                regs.pop(r, None)
+                    part.getenv_flag = True
+                    part.flag_block = block_start
 
         if mn == "ret":
             break
+
+    return part, callees
+
+
+def analyze(binary):
+    elf = binary.elf
+    res = Analysis()
+
+    for name, addr in binary.functions():
+        low = name.lower()
+        if any(k in low for k in WIN_KEYWORDS):
+            res.win_funcs.append((name, addr))
+
+    main = find_main(binary)
+    if main is None:
+        res.notes.append("could not locate main")
+        return res
+    if "main" not in elf.symbols:
+        res.notes.append(f"stripped: main located via _start @ {hex(main)}")
+
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    md.detail = True
+    names = _name_map(elf)
+
+    # scan main, its direct callees, and all known function symbols
+    to_scan = {main}
+    part_main, callees = _scan(binary, main, md, names)
+    to_scan |= callees
+    to_scan |= {a for _, a in binary.functions()}
+
+    parts = {main: part_main}
+    for addr in to_scan:
+        if addr not in parts:
+            parts[addr], _ = _scan(binary, addr, md, names)
+
+    # pick the vulnerable frame: prefer one with an overflow input, else inputs
+    def frame_score(p):
+        if p.overflow_input():
+            return (2, len(p.inputs))
+        if p.inputs:
+            return (1, len(p.inputs))
+        return (0, 0)
+
+    vuln_addr = max(parts, key=lambda a: frame_score(parts[a]))
+    vframe = parts[vuln_addr]
+    res.inputs = vframe.inputs
+    res.checks = vframe.checks
+    res.fmt_leaks = vframe.fmt_leaks
+    res.canary_off = vframe.canary_off
+    if vuln_addr != main:
+        res.notes.append(f"vulnerable frame: function @ {hex(vuln_addr)}")
+
+    # flag block / getenv("FLAG") from any scanned frame
+    for p in parts.values():
+        if p.getenv_flag:
+            res.getenv_flag = True
+            res.flag_block = res.flag_block or p.flag_block
 
     return res
 
 
 def describe(res):
     report.step("Static analysis of main():")
-    if res.primary_input:
-        i = res.primary_input
-        size = f", n={hex(i.nbytes)}" if i.nbytes is not None else ""
-        report.info(f"  input: {i.func}  -> buffer at rbp{i.off:+#x}"
-                    f"  ({'unbounded' if i.unbounded else 'bounded'}{size})")
-    else:
+    for i in res.inputs:
+        sz = f", {i.size}B" if i.size is not None else ""
+        report.info(f"  input: {i.func}  -> rbp{i.off:+#x}{sz}  "
+                    f"({'overflow' if i.unbounded else 'bounded'})")
+    if not res.inputs:
         report.info("  input: none detected")
     for c in res.checks:
         report.info(f"  strcmp(rbp{c.off:+#x}, {c.const!r})")
+    for off in res.fmt_leaks:
+        report.info(f"  printf(rbp{off:+#x})  <-- FORMAT STRING (leak primitive)")
+    if res.canary_off is not None:
+        report.info(f"  canary stored at rbp{res.canary_off:+#x}")
     if res.getenv_flag:
         report.info(f"  getenv(\"FLAG\") printed; flag block @ "
                     f"{hex(res.flag_block) if res.flag_block else '?'}")

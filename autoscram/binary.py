@@ -1,4 +1,7 @@
 """Binary: thin wrapper around pwntools ELF with protection flags and helpers."""
+import os
+import stat
+
 from pwn import ELF
 
 from . import report
@@ -7,7 +10,19 @@ from . import report
 class Binary:
     def __init__(self, path):
         self.path = path
+        self._ensure_executable(path)
         self.elf = ELF(path, checksec=False)
+
+    @staticmethod
+    def _ensure_executable(path):
+        """process() needs the local binary to be +x; fix it best-effort."""
+        try:
+            mode = os.stat(path).st_mode
+            if not (mode & stat.S_IXUSR):
+                os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                report.info(f"made {path} executable (+x)")
+        except Exception:
+            pass
 
     # --- protections ---
     @property
@@ -21,53 +36,12 @@ class Binary:
     @property
     def relro(self):  return self.elf.relro
 
-    @property
-    def bits(self):
-        return self.elf.bits
-
-    @property
-    def static(self):
-        return self.elf.statically_linked
-
-    def language(self):
-        """Best-effort source-language guess from symbols and rodata.
-
-        AUTOSCRAM's analysis assumes C/libc idioms (scanf, gets, strcmp,
-        system). Rust and Go binaries don't use them and are memory-safe by
-        default, so detecting them lets us say so instead of finding nothing.
-        """
-        syms = " ".join(self.elf.symbols.keys()).lower()
-        if "__rust_alloc" in syms or "rust_eh_personality" in syms \
-                or "rust_begin_unwind" in syms:
-            return "rust"
-        if "runtime.main" in syms or "go.buildid" in syms \
-                or self._has_section(".gopclntab"):
-            return "go"
-        if "_zn" in syms and "17h" in syms:        # Itanium-mangled C++/Rust
-            return "rust" if "4core" in syms else "c++"
-        return "c"
-
-    def _has_section(self, name):
-        try:
-            return self.elf.get_section_by_name(name) is not None
-        except Exception:
-            return False
-
     def summary(self):
         report.info(
-            f"Arch={self.arch}/{self.bits}bit  PIE={'on' if self.pie else 'off'}  "
+            f"Arch={self.arch}  PIE={'on' if self.pie else 'off'}  "
             f"NX={'on' if self.nx else 'off'}  "
             f"Canary={'yes' if self.canary else 'no'}  "
-            f"RELRO={self.relro or 'none'}  "
-            f"{'static' if self.static else 'dynamic'}")
-        if self.arch != "amd64":
-            report.warn(f"Arch is {self.arch}/{self.bits}bit: AUTOSCRAM only "
-                        "handles x86-64. Analysis and strategies will not run.")
-        lang = self.language()
-        if lang != "c":
-            report.warn(f"Binary looks like {lang.upper()}: its bug classes "
-                        "(logic / unsafe / memory-safe by default) are outside "
-                        "AUTOSCRAM's C/libc-overflow model.")
+            f"RELRO={self.relro or 'none'}")
         if self.canary:
             report.warn("Stack canary present: a plain overflow is caught; "
                         "you likely need a canary leak first.")
