@@ -44,6 +44,7 @@ python3 autoscram.py ./challenge --remote host:1337
 | `ret2win` | a win function / flag block exists and the binary is non-PIE | overflow RET → jump to the flag-printing code |
 | `ret2system` | binary imports `system` and holds `/bin/sh` (non-PIE) | pwntools ROP `system("/bin/sh")` → shell |
 | `flag-checker` | no memory bug — the binary just **verifies** your input against a constant (C or **Rust**) | reads the checker's constant arrays, derives the input for XOR / ADD / SUB / direct compare, and **verifies by running the binary** |
+| `cipher-fmt` | a substitution decoder whose decoded output is passed to **`printf` as its format** (e.g. the emoji cipher's remote) | reconstructs the table, **encodes a `%p`/`%s` format-string leak as tokens**, fires it at the local/remote target and reads the flag out of the leak — one command, no manual payload |
 | `subcipher` | the binary is a **substitution-cipher tool** (e.g. an emoji cipher) that maps plaintext bytes to tokens and has no embedded flag | reconstructs the table (by symbol, or by **scanning data** when stripped), **suggests what cipher it is**, writes the full mapping to `<bin>.cipher_map.txt`, and decodes the ciphertext passed via `--cipher-input` (chaining `magic-decode` if the result is still encoded) |
 | `magic-decode` | you pass `--cipher-input` and the blob is a **standard encoding/cipher** (base64, hex, rot13, xor, morse, …) | tries the common decoders (chained a few layers), ranks by flag-shape / readability, and suggests the chain |
 

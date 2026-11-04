@@ -110,6 +110,7 @@ def main(argv=None):
                 order = [s for s in strategies.ALL if s.name == ans] or order
 
     remote_target = _remote_from_args(args)
+    ctx.remote_target = remote_target      # strategies may reconnect on their own
 
     # --- try strategies in order, verifying locally when possible ---
     for strat in order:

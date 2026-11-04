@@ -65,25 +65,47 @@ def _data_sections(binary):
     return out
 
 
+def locate_table(binary):
+    """Return (table_addr, how) by symbol first, then by scanning data."""
+    addr = binary.elf.symbols.get("cipher_table")
+    if addr is not None:
+        return addr, "symbol 'cipher_table'"
+    for n, a in binary.elf.symbols.items():
+        if "table" in n.lower() and not binary.in_executable(a):
+            return a, f"symbol '{n}'"
+    read, in_mapped, in_rodata = _readers(binary)
+    found = find_table_by_scan(read, in_mapped, in_rodata,
+                               _data_sections(binary))
+    if found is not None:
+        return found, "scan of data sections"
+    return None, "none"
+
+
+def build_encoder(binary):
+    """Return (emojify, mapping): emojify(str) -> emoji bytes, via the table."""
+    addr, _ = locate_table(binary)
+    if addr is None:
+        return None, {}
+    read, in_mapped, _ = _readers(binary)
+    mapping = reconstruct_table(read, in_mapped, addr)
+    by_byte = {c[0]: t for c, t in invert(mapping).items()}
+
+    def emojify(s):
+        try:
+            return b"".join(by_byte[ord(ch)] for ch in s)
+        except KeyError as exc:
+            raise ValueError(f"char {exc} has no token in the cipher table")
+
+    return emojify, mapping
+
+
 class SubstitutionCipher(Strategy):
     name = "subcipher"
     desc = "reconstruct a substitution table, suggest the cipher, decode it"
     verifiable = False               # no embedded flag; nothing to self-test
 
     def _table(self, binary):
-        """Return the table address: by symbol first, then by scanning data."""
-        addr = binary.elf.symbols.get("cipher_table")
-        if addr is not None:
-            return addr, "symbol 'cipher_table'"
-        for n, a in binary.elf.symbols.items():
-            if "table" in n.lower() and not binary.in_executable(a):
-                return a, f"symbol '{n}'"
-        read, in_mapped, in_rodata = _readers(binary)
-        found = find_table_by_scan(read, in_mapped, in_rodata,
-                                   _data_sections(binary))
-        if found is not None:
-            return found, "scan of data sections"
-        return None, "none"
+        return locate_table(binary)
 
     def detect(self, ctx):
         b = ctx.binary
